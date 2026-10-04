@@ -273,7 +273,26 @@ def _evaluate_scalar(compiled: CompiledExpression, env_base: Mapping[str, float]
 
 def numerical_gradient(compiled: CompiledExpression, x_base: Mapping[str, float], names: tuple[str, ...]) -> np.ndarray:
     """中心差分灵敏度 dy/dx（基本单位空间）。"""
+    grad, _ = numerical_gradient_with_noise(compiled, x_base, names)
+    return grad
+
+
+def numerical_gradient_with_noise(
+    compiled: CompiledExpression, x_base: Mapping[str, float], names: tuple[str, ...]
+) -> tuple[np.ndarray, np.ndarray]:
+    """中心差分灵敏度及其逐分量舍入误差尺度（基本单位空间）。
+
+    返回 ``(grad, noise)``。``noise[k]`` 估计函数值舍入（~eps·|f|）经
+    ``(f(x+h)-f(x-h))/(2h)`` 传播到第 k 个梯度分量的量级：
+
+        noise[k] = eps · max(|f(x+h)|, |f(x-h)|) / (2h)
+
+    它随问题自身尺度收缩（小量级模型的 noise 同样小）。真实梯度只有
+    远低于该尺度时才与舍入噪声不可区分——“零灵敏度”裁决必须用它
+    （逐输入、按自身尺度），绝不能与其他输入的灵敏度量级比较。
+    """
     grad = np.zeros(len(names))
+    noise = np.zeros(len(names))
     for k, name in enumerate(names):
         x0 = x_base[name]
         h = _EPS13 * max(abs(x0), _EPS13)
@@ -284,7 +303,8 @@ def numerical_gradient(compiled: CompiledExpression, x_base: Mapping[str, float]
         yp = _evaluate_scalar(compiled, env_plus)
         ym = _evaluate_scalar(compiled, env_minus)
         grad[k] = (yp - ym) / (2.0 * h)
-    return grad
+        noise[k] = _EPS * max(abs(yp), abs(ym)) / (2.0 * h)
+    return grad, noise
 
 
 # ---------------------------------------------------------------------------

@@ -561,7 +561,13 @@ u_c²(y) = Σ gᵢgⱼCov(i,j) ≤ 目标²
 v(u) = C + B·u + A·u²,   A = g_k²,  B = 2·g_k·Σ_{j≠k} g_j·ρ_kj·s_j,  C = Σ_{i≠k,j≠k} g_i g_j Cov(i,j)
 ```
 
-**所有协方差项（含负相关）都纳入二次不等式。** 响应给出：
+**所有协方差项（含负相关）都纳入二次不等式。** 零值与舍入误差的裁决全部**按问题自身尺度**进行，绝不用与单位/量级无关的绝对阈值：
+
+* **零灵敏度**：`|g_k|` 与该输入中心差分梯度自身的舍入误差尺度（`eps·max|f(x±h)|/(2h)`，随问题尺度收缩）比较——真实微小灵敏度（如 `1e-13`）即使远小于其他输入的灵敏度也**保留**，只有与舍入噪声不可区分的才判零；
+* **根吸附**：把理论上为零的根吸到 0 的容差与根自身量级同阶（`eps^(1/3)·根尺度`，无绝对下限）——小量级模型的真实小正根（如 `1e-12` m）不会被吸到 0；
+* **端点清理**：只归一 `-0.0` 与防御式负值，真实小正端点（如 `1e-9` mm）原样保留。
+
+响应给出：
 
 * `interval.lower` / `interval.upper`：输入**声明单位**下的端点（`upper` 为 `null` 表示无上限）；
 * `interval.lower_inclusive` / `interval.upper_inclusive`：端点开闭性；
@@ -720,6 +726,111 @@ curl -sS -X POST http://localhost:8000/api/v1/precision-budgets \
 
 反求接口是幂等只读的：连续重复调用返回完全一致的结果；调用前后 `GET /api/v1/evaluations` 的记录数不变，登记模型的输入标准不确定度也不被修改。反求之后仍可正常提交 `/api/v1/evaluations`（201/200 幂等语义不变）。
 
+#### 9.5 小量级反求：微小灵敏度与小正端点不误判为零
+
+与[第 8 节](#8-小量级标准不确定度1e-9真实方差不得归零)传播管线同理，反求的零值裁决也随问题尺度收缩：微小但真实的灵敏度（`1e-13`）不被相对阈值误判为零，微小但真实的正上界（`1e-9` mm）不被端点清理清零。
+
+**例 1：毫米模型的小正上界。** 直接长度测量 `y = L`（L = 0(2e-9) mm，正态），目标 u(y) ≤ 1e-9 mm：
+
+```bash
+curl -sS -X POST http://localhost:8000/api/v1/models \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "version": "budget-tiny-length",
+    "name": "长度直接测量 y=L（小量级反求示例）",
+    "expression": "L",
+    "inputs": [
+      {"name": "L", "value": 0.0, "unit": "millimeter", "standard_uncertainty": 2e-9, "distribution": "normal"}
+    ],
+    "output_unit": "millimeter"
+  }'
+# HTTP 201
+
+curl -sS -X POST http://localhost:8000/api/v1/precision-budgets \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model_version": "budget-tiny-length",
+    "input_name": "L",
+    "target": {"standard_uncertainty": 1e-9, "unit": "millimeter"}
+  }'
+```
+
+返回 `200`（以下为**实际响应**）：可行区间是闭区间 **[0, 1e-9] mm**——上界 1e-9 mm 是真实正根（基本单位空间 1e-12 m），不会被绝对阈值吸到 0；独立输入的零端点闭。当前 uL = 2e-9 mm 超标，`satisfied=false`：
+
+```json
+{
+  "model_version": "budget-tiny-length",
+  "input_name": "L",
+  "input_unit": "mm",
+  "target": {"standard_uncertainty": 1e-09, "unit": "millimeter"},
+  "target_in_output_unit": {"standard_uncertainty": 1e-09, "unit": "millimeter"},
+  "sensitivity": {"coefficient": 1.0, "unit": "millimeter/mm"},
+  "current_standard_uncertainty": {"value": 2e-09, "unit": "mm"},
+  "current_combined_standard_uncertainty": {"value": 2e-09, "unit": "millimeter"},
+  "satisfied": false,
+  "interval": {
+    "feasible": true,
+    "lower": 0.0,
+    "lower_inclusive": true,
+    "upper": 1e-09,
+    "upper_inclusive": true,
+    "unbounded_upper": false
+  }
+}
+```
+
+**例 2：微小非零灵敏度不是零。** 无量纲模型 `y = a + 1e-13*b`（a = b = 0，ua = 0、ub = 2e9，均正态），目标 u(y) ≤ 1e-4，反求 b。b 的灵敏度 `1e-13` 比 a 的 `1.0` 小 13 个数量级，但它是真实灵敏度：v(u) = (1e-13·u)² ≤ 1e-8 ⇒ **ub ∈ [0, 1e9]**（有限上界），而不是零灵敏度的 `[0, +∞)`：
+
+```bash
+curl -sS -X POST http://localhost:8000/api/v1/models \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "version": "budget-tiny-sens",
+    "name": "微小灵敏度 y=a+1e-13*b（小量级反求示例）",
+    "expression": "a + 1e-13*b",
+    "inputs": [
+      {"name": "a", "value": 0.0, "unit": "dimensionless", "standard_uncertainty": 0.0, "distribution": "normal"},
+      {"name": "b", "value": 0.0, "unit": "dimensionless", "standard_uncertainty": 2e9, "distribution": "normal"}
+    ],
+    "output_unit": "dimensionless"
+  }'
+# HTTP 201
+
+curl -sS -X POST http://localhost:8000/api/v1/precision-budgets \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model_version": "budget-tiny-sens",
+    "input_name": "b",
+    "target": {"standard_uncertainty": 1e-4, "unit": "dimensionless"}
+  }'
+```
+
+返回 `200`（以下为**实际响应**；上界 `1000000000.0000001` 即 1e9，尾差来自中心差分灵敏度的 ~1e-16 相对舍入）：
+
+```json
+{
+  "model_version": "budget-tiny-sens",
+  "input_name": "b",
+  "input_unit": "dimensionless",
+  "target": {"standard_uncertainty": 0.0001, "unit": "dimensionless"},
+  "target_in_output_unit": {"standard_uncertainty": 0.0001, "unit": "dimensionless"},
+  "sensitivity": {"coefficient": 1e-13, "unit": "dimensionless/dimensionless"},
+  "current_standard_uncertainty": {"value": 2000000000.0, "unit": "dimensionless"},
+  "current_combined_standard_uncertainty": {"value": 0.0002, "unit": "dimensionless"},
+  "satisfied": false,
+  "interval": {
+    "feasible": true,
+    "lower": 0.0,
+    "lower_inclusive": true,
+    "upper": 1000000000.0000001,
+    "upper_inclusive": true,
+    "unbounded_upper": false
+  }
+}
+```
+
+> 当前 ub = 2e9 时 uc = 2e-4 > 1e-4，故 `satisfied=false`；把 ub 收紧到 1e9 以内即达标。若 b 的灵敏度是真零（如 `2*(a-a)+b` 中的 a），同样的请求仍返回 `[0, +∞)`（上界 `null`、`unbounded_upper=true`，见 [9.3](#93-零灵敏度--无上限区间上界-null)）——零与非零按梯度自身舍入尺度裁决，与灵敏度的绝对大小无关。
+
 ## 模型表达式白名单
 
 表达式在服务端经 Python AST 解析后**逐节点白名单校验**，不经过任何 `eval`：
@@ -775,7 +886,7 @@ pip install -r requirements.txt pytest httpx
 python -m pytest -q
 ```
 
-测试覆盖：表达式注入拒绝、单位换算与量纲校验、PSD 拒绝（< -1e-8）/舍入修复（[-1e-8,0)，保单位对角）/奇异接受（r=±1 零特征值）、r=±1 的 GUM 解析解 |ua+r·ub| 与 MC 同/反向传播、完全抵消退化为确定值、**小量级（u=1e-9）真实 ~1e-18 方差不被固定绝对阈值钳零（r=+1→2e-9、r=−1 不等→1e-9、r=−1 相等→0）及其 HTTP 登记/计算/幂等/查询/非法矩阵拒绝不落库**、MC 与线性高斯解析解对比、固定种子可复现、幂等与冲突、不收敛/NaN 不落库、查询接口、**精度反求二次不等式（负相关 r=−1→ua∈[1,3] 双侧有界、相关输入零端点开、零灵敏度→上界 null 无上限、无法达标→空区间、目标零/单位换算/未知版本/未知输入/量纲不符/负值/NaN/Inf 拒绝、只读不改模型不写记录不影响幂等与传播）**等（71 个用例）。
+测试覆盖：表达式注入拒绝、单位换算与量纲校验、PSD 拒绝（< -1e-8）/舍入修复（[-1e-8,0)，保单位对角）/奇异接受（r=±1 零特征值）、r=±1 的 GUM 解析解 |ua+r·ub| 与 MC 同/反向传播、完全抵消退化为确定值、**小量级（u=1e-9）真实 ~1e-18 方差不被固定绝对阈值钳零（r=+1→2e-9、r=−1 不等→1e-9、r=−1 相等→0）及其 HTTP 登记/计算/幂等/查询/非法矩阵拒绝不落库**、MC 与线性高斯解析解对比、固定种子可复现、幂等与冲突、不收敛/NaN 不落库、查询接口、**精度反求二次不等式（负相关 r=−1→ua∈[1,3] 双侧有界、相关输入零端点开、零灵敏度→上界 null 无上限、无法达标→空区间、目标零/单位换算/未知版本/未知输入/量纲不符/负值/NaN/Inf 拒绝、只读不改模型不写记录不影响幂等与传播）**、**小量级反求（毫米模型目标 1e-9→闭区间 [0,1e-9] mm 真实小正上界保留、1e-13 微小灵敏度不误判为零→[0,1e9] 有限上界、小量级负相关双端区间 [1e-9,3e-9]、小量级真零灵敏度仍无上限）**等（75 个用例）。
 
 ## 项目结构
 

@@ -336,6 +336,104 @@ def test_missing_target_field_422(client):
 
 
 # ---------------------------------------------------------------------------
+# 小量级反求：真实微小灵敏度/小正端点不得被绝对阈值误判为零
+# ---------------------------------------------------------------------------
+
+def test_tiny_scale_length_closed_interval(client):
+    # y = L（毫米），L = 0、uL = 2e-9 mm，目标 1e-9 mm => u ∈ [0, 1e-9] mm 闭区间。
+    # 旧实现把 1e-12 m 的根按绝对阈值（~3.7e-11）吸到 0、_tidy 再把 1e-9 mm 清零。
+    model = {
+        "version": "pb-tiny-length",
+        "expression": "L",
+        "inputs": [
+            {"name": "L", "value": 0.0, "unit": "millimeter",
+             "standard_uncertainty": 2e-9, "distribution": "normal"},
+        ],
+        "output_unit": "millimeter",
+        "correlations": [],
+    }
+    _register(client, model)
+    r = _budget(client, "pb-tiny-length", "L", 1e-9, "millimeter")
+    assert r.status_code == 200, r.text
+    body = r.json()
+    iv = body["interval"]
+    assert iv["feasible"] is True
+    assert iv["lower"] == 0.0 and iv["lower_inclusive"] is True   # 独立输入零端点闭
+    assert iv["upper"] == 1e-9 and iv["upper_inclusive"] is True  # 真实小正上界保留
+    assert iv["unbounded_upper"] is False
+    # 当前 uL = 2e-9 > 1e-9，不达标
+    assert body["satisfied"] is False
+    assert abs(body["current_combined_standard_uncertainty"]["value"] - 2e-9) < 1e-20
+
+
+def test_tiny_sensitivity_not_misjudged_as_zero(client):
+    # y = a + 1e-13*b（无量纲），a = b = 0，ua = 0、ub = 2e9，目标 1e-4，反求 b。
+    # 真实灵敏度 1e-13（远小于 a 的 1.0）不得被相对阈值判为零：
+    # v(u) = (1e-13*u)^2 <= 1e-8 => u ∈ [0, 1e9]。
+    model = {
+        "version": "pb-tiny-sens",
+        "expression": "a + 1e-13*b",
+        "inputs": [
+            {"name": "a", "value": 0.0, "unit": "dimensionless",
+             "standard_uncertainty": 0.0, "distribution": "normal"},
+            {"name": "b", "value": 0.0, "unit": "dimensionless",
+             "standard_uncertainty": 2e9, "distribution": "normal"},
+        ],
+        "output_unit": "dimensionless",
+        "correlations": [],
+    }
+    _register(client, model)
+    r = _budget(client, "pb-tiny-sens", "b", 1e-4)
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert abs(body["sensitivity"]["coefficient"] - 1e-13) < 1e-20
+    iv = body["interval"]
+    assert iv["feasible"] is True
+    assert iv["lower"] == 0.0 and iv["lower_inclusive"] is True
+    assert abs(iv["upper"] - 1e9) / 1e9 < 1e-9 and iv["upper_inclusive"] is True
+    assert iv["unbounded_upper"] is False
+    # 当前 ub = 2e9 => uc = 2e-4 > 1e-4，不达标
+    assert body["satisfied"] is False
+    assert abs(body["current_combined_standard_uncertainty"]["value"] - 2e-4) < 1e-15
+
+
+def test_tiny_scale_negative_correlation_two_sided(client):
+    # 小量级 + 负相关：y = a + b，r = -1，ub = 2e-9，目标 1e-9
+    # => (ua - 2e-9)^2 <= 1e-18 => ua ∈ [1e-9, 3e-9]，双端有界且端点不丢。
+    _register(client, _sum_model("pb-tiny-rm1", 1e-10, 2e-9, -1.0))
+    r = _budget(client, "pb-tiny-rm1", "a", 1e-9)
+    assert r.status_code == 200, r.text
+    iv = r.json()["interval"]
+    assert iv["feasible"] is True and iv["unbounded_upper"] is False
+    assert abs(iv["lower"] - 1e-9) < 1e-20 and iv["lower_inclusive"] is True
+    assert abs(iv["upper"] - 3e-9) < 1e-20 and iv["upper_inclusive"] is True
+
+
+def test_tiny_scale_zero_sensitivity_still_unbounded(client):
+    # 小量级模型中的真零灵敏度（2*(a-a)）仍判为零：可行时无上限。
+    model = {
+        "version": "pb-tiny-flat",
+        "expression": "2*(a - a) + b",
+        "inputs": [
+            {"name": "a", "value": 0.0, "unit": "dimensionless",
+             "standard_uncertainty": 1e-9, "distribution": "normal"},
+            {"name": "b", "value": 0.0, "unit": "dimensionless",
+             "standard_uncertainty": 1e-9, "distribution": "normal"},
+        ],
+        "output_unit": "dimensionless",
+        "correlations": [],
+    }
+    _register(client, model)
+    body = _budget(client, "pb-tiny-flat", "a", 1e-8).json()
+    assert body["sensitivity"]["coefficient"] == 0.0
+    iv = body["interval"]
+    assert iv["feasible"] is True and iv["unbounded_upper"] is True
+    assert iv["upper"] is None
+    assert iv["lower"] == 0.0 and iv["lower_inclusive"] is True
+    assert body["satisfied"] is True
+
+
+# ---------------------------------------------------------------------------
 # 只读语义：不改模型、不写计算记录；既有功能不受影响
 # ---------------------------------------------------------------------------
 

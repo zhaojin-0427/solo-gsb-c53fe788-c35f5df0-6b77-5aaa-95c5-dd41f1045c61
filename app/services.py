@@ -19,7 +19,7 @@ from .engine import (
     _EPS,
     _EPS13,
     build_correlation_matrix,
-    numerical_gradient,
+    numerical_gradient_with_noise,
     run_gum,
     run_monte_carlo,
 )
@@ -432,8 +432,11 @@ def _f(x: Any) -> float:
 # 测量精度反求（precision budget）
 # ---------------------------------------------------------------------------
 
-#: 名义点灵敏度判定为“零”的相对阈值（线性无关输入如 2*(a-a) 恰为 0）
-_ZERO_SENSITIVITY_REL = 1e-12
+#: 名义点灵敏度判定为“零”的噪声倍数：|g_k| 不超过其自身舍入误差尺度的
+#: 该倍数时判为零（如 2*(a-a) 恰为 0）。判定逐输入按自身尺度进行，
+#: 绝不与其他输入的灵敏度量级比较（那会把 1e-13 级的真实微小灵敏度
+#: 误判为零）；倍数 >1 只为覆盖表达式多步运算累积的舍入。
+_ZERO_SENSITIVITY_NOISE_FACTOR = 100.0
 
 
 def _unit_label(spec: str) -> str:
@@ -490,7 +493,7 @@ def solve_precision_budget(req: PrecisionBudgetCreate) -> dict[str, Any]:
         names, [(t[0], t[1], float(t[2])) for t in record["correlations"]], zero_std
     )
 
-    grad = numerical_gradient(compiled, x_base, names)
+    grad, grad_noise = numerical_gradient_with_noise(compiled, x_base, names)
     if not np.all(np.isfinite(grad)):
         raise PropagationError("名义点邻域产生了非有限结果（NaN/Inf），无法进行精度反求")
 
@@ -519,8 +522,10 @@ def solve_precision_budget(req: PrecisionBudgetCreate) -> dict[str, Any]:
         C = 0.0
 
     # 4. 端点（先在基本单位空间求解）
-    grad_scale = float(np.max(np.abs(grad))) if len(grad) else 0.0
-    zero_g = gk == 0.0 or abs(gk) <= _ZERO_SENSITIVITY_REL * max(grad_scale, _EPS13)
+    # 零灵敏度裁决：与该输入梯度自身的舍入误差尺度比较（随问题尺度收缩，
+    # 小量级模型的真实微小灵敏度如 1e-13 必须保留），绝不与其他输入的
+    # 灵敏度量级比较。
+    zero_g = gk == 0.0 or abs(gk) <= _ZERO_SENSITIVITY_NOISE_FACTOR * float(grad_noise[k])
     # 与 k 相关（登记矩阵中存在边）时，u=0 端点无效：相关系数在零方差处无定义
     correlated = any(names[k] in (t[0], t[1]) for t in record["correlations"])
 
@@ -546,9 +551,11 @@ def solve_precision_budget(req: PrecisionBudgetCreate) -> dict[str, Any]:
             # v(u) 恒大于目标平方（开口向上且无实根）=> 无论 u 取何值都无法达标
             empty = True
         else:
-            # 实根存在：可行域为 [u_-, u_+] 与 u ≥ 0 的交
+            # 实根存在：可行域为 [u_-, u_+] 与 u ≥ 0 的交。
+            # 根的舍入容差与根自身量级同阶（无任何绝对下限）：小量级模型的
+            # 真实小正根（如 1e-12 m）必须保留，不能被绝对阈值吸到 0。
             root_eps = _EPS13 * max(math.sqrt(max(disc, 0.0)) / (2.0 * A),
-                                    abs(B) / (2.0 * A), _EPS13)
+                                    abs(B) / (2.0 * A))
             u_minus = (-B - math.sqrt(max(disc, 0.0))) / (2.0 * A)
             u_plus = (-B + math.sqrt(max(disc, 0.0))) / (2.0 * A)
             if u_plus < -root_eps:
@@ -660,9 +667,12 @@ def _target_to_output(unit_spec: str, value: float, out_unit: pint.Unit, out_spe
 
 
 def _tidy(v: float) -> float:
-    """清理 -0.0 与舍入产生的微小负值（端点理论上非负）。"""
-    if v == 0.0:
+    """端点理论上非负：仅把 -0.0 与（防御式的）负值归一到 0。
+
+    真实的小正端点（如 1e-9 mm）必须原样保留——零值与舍入误差的裁决
+    已在基本单位空间按根的量级完成，这里绝不能再套用与单位尺度无关的
+    绝对阈值（旧实现会把任何小于 ~6e-6 的正端点错误清零）。
+    """
+    if v <= 0.0:
         return 0.0
-    if abs(v) <= _EPS13 * max(1.0, abs(v)):
-        return 0.0
-    return max(v, 0.0)
+    return v
