@@ -195,6 +195,99 @@ def test_zero_sensitivity_target_unreachable_empty(client):
 
 
 # ---------------------------------------------------------------------------
+# 小量级精度反求：真实非零灵敏度与微小正端点不得被固定绝对阈值误判
+# ---------------------------------------------------------------------------
+
+def test_tiny_magnitude_mm_endpoint_preserved(client):
+    # 输入、输出均为毫米：y = L，L = 0、uL = 2e-9、目标 1e-9 mm。
+    # v(u) = u² ≤ (1e-9)²，根在基本单位空间只有 1e-12（米）——旧实现的
+    # 固定绝对清理阈值（eps^(1/3) 量级）会把真实小正上界清成 0。
+    model = {
+        "version": "pb-tiny-mm",
+        "expression": "L",
+        "inputs": [
+            {"name": "L", "value": 0.0, "unit": "millimeter",
+             "standard_uncertainty": 2e-9, "distribution": "normal"},
+        ],
+        "output_unit": "millimeter",
+        "correlations": [],
+    }
+    _register(client, model)
+    r = _budget(client, "pb-tiny-mm", "L", 1e-9, "millimeter")
+    assert r.status_code == 200, r.text
+    body = r.json()
+    iv = body["interval"]
+    assert iv["feasible"] is True
+    assert iv["lower"] == 0.0 and iv["lower_inclusive"] is True
+    assert abs(iv["upper"] - 1e-9) <= 1e-18 and iv["upper_inclusive"] is True
+    assert iv["unbounded_upper"] is False
+    # 当前 uL=2e-9 => uc=2e-9 > 1e-9，不达标；灵敏度 1 mm/mm
+    assert body["satisfied"] is False
+    assert abs(body["current_combined_standard_uncertainty"]["value"] - 2e-9) < 1e-18
+    assert body["sensitivity"]["coefficient"] == 1.0
+
+
+def test_tiny_coefficient_nonzero_sensitivity_bounded(client):
+    # 无量纲 y = a + 1e-13*b，ua = 0、ub = 2e9、目标 1e-4。
+    # 反求 b：(1e-13·ub)² ≤ 1e-8 => ub ∈ [0, 1e9]。1e-13 的真实非零灵敏度
+    # 远大于中心差分舍入误差界，旧实现的固定相对阈值（1e-12·梯度尺度）
+    # 会把它误判成“零灵敏度”而错误给出无上限区间。
+    model = {
+        "version": "pb-tiny-coef",
+        "expression": "a + 1e-13*b",
+        "inputs": [
+            {"name": "a", "value": 0.0, "unit": "dimensionless",
+             "standard_uncertainty": 0.0, "distribution": "normal"},
+            {"name": "b", "value": 0.0, "unit": "dimensionless",
+             "standard_uncertainty": 2e9, "distribution": "normal"},
+        ],
+        "output_unit": "dimensionless",
+        "correlations": [],
+    }
+    _register(client, model)
+    r = _budget(client, "pb-tiny-coef", "b", 1e-4)
+    assert r.status_code == 200, r.text
+    body = r.json()
+    iv = body["interval"]
+    assert iv["feasible"] is True and iv["unbounded_upper"] is False
+    assert iv["lower"] == 0.0 and iv["lower_inclusive"] is True
+    assert abs(iv["upper"] - 1e9) < 1e4 and iv["upper_inclusive"] is True
+    # 灵敏度必须保留为真实正值 1e-13（而不是钳成 0）
+    assert abs(body["sensitivity"]["coefficient"] - 1e-13) < 1e-18
+    # 当前 ub=2e9 => uc=2e-4 > 1e-4，不达标
+    assert body["satisfied"] is False
+    assert abs(body["current_combined_standard_uncertainty"]["value"] - 2e-4) < 1e-10
+    # 反求 a：a 的灵敏度恰为 1，b 的固定贡献 2e-4 > 1e-4 => 无法达标，空区间
+    body_a = _budget(client, "pb-tiny-coef", "a", 1e-4).json()
+    assert body_a["sensitivity"]["coefficient"] == 1.0
+    iv_a = body_a["interval"]
+    assert iv_a["feasible"] is False and iv_a["lower"] is None and iv_a["upper"] is None
+
+
+def test_tiny_magnitude_negative_correlation_both_sided(client):
+    # 小量级负相关双端区间：y=a+b，r=-1，ub=2e-9，目标 1e-9
+    # => |ua-2e-9| ≤ 1e-9 => ua ∈ [1e-9, 3e-9]，两侧闭，不是单一上限。
+    model = _sum_model("pb-tiny-rm1", 1e-9, 2e-9, -1.0)
+    _register(client, model)
+    iv = _budget(client, "pb-tiny-rm1", "a", 1e-9).json()["interval"]
+    assert iv["feasible"] is True
+    assert iv["lower_inclusive"] is True and iv["upper_inclusive"] is True
+    assert abs(iv["lower"] - 1e-9) <= 1e-18
+    assert abs(iv["upper"] - 3e-9) <= 1e-17
+
+
+def test_tiny_magnitude_correlated_zero_endpoint_open(client):
+    # 小量级相关输入的零端点开闭性：r=-1，ub=5e-10，目标 1e-9
+    # => ua ∈ (0, 1.5e-9]（相关对不能引用零标准差输入，故零端点开）。
+    model = _sum_model("pb-tiny-open", 1e-9, 5e-10, -1.0)
+    _register(client, model)
+    iv = _budget(client, "pb-tiny-open", "a", 1e-9).json()["interval"]
+    assert iv["feasible"] is True
+    assert iv["lower"] == 0.0 and iv["lower_inclusive"] is False
+    assert abs(iv["upper"] - 1.5e-9) <= 1e-18 and iv["upper_inclusive"] is True
+
+
+# ---------------------------------------------------------------------------
 # 目标 0、单输入、单位换算
 # ---------------------------------------------------------------------------
 

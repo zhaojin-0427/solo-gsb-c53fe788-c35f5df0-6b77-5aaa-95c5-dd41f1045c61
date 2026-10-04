@@ -271,9 +271,31 @@ def _evaluate_scalar(compiled: CompiledExpression, env_base: Mapping[str, float]
     return yv
 
 
-def numerical_gradient(compiled: CompiledExpression, x_base: Mapping[str, float], names: tuple[str, ...]) -> np.ndarray:
+def numerical_gradient(
+    compiled: CompiledExpression, x_base: Mapping[str, float], names: tuple[str, ...]
+) -> np.ndarray:
     """中心差分灵敏度 dy/dx（基本单位空间）。"""
+    grad, _ = numerical_gradient_with_errors(compiled, x_base, names)
+    return grad
+
+
+def numerical_gradient_with_errors(
+    compiled: CompiledExpression, x_base: Mapping[str, float], names: tuple[str, ...]
+) -> tuple[np.ndarray, np.ndarray]:
+    """中心差分灵敏度，并逐分量给出舍入误差界（均为基本单位空间）。
+
+    差分步长 h = eps^(1/3)·max(|x0|, eps^(1/3)) 使舍入与截断误差平衡；
+    线性模型截断误差为 0，第 k 个分量的舍入误差界取保守估计
+
+        e_k = eps·(|y+| + |y-|)/(2h) + eps·|g_k|
+
+    名义点为 0 时 h = eps^(2/3)，该界退化为 eps^(1/3)·|y±|，仍随模型
+    输出尺度收缩——因此 1e-13 这类真实小系数（在可行不确定度尺度上对
+    输出有贡献）不会被固定绝对阈值淹没，而结构性零灵敏度（如 a−a）
+    产生位级相等的 y±，g_k 恰为 0.0。
+    """
     grad = np.zeros(len(names))
+    errs = np.zeros(len(names))
     for k, name in enumerate(names):
         x0 = x_base[name]
         h = _EPS13 * max(abs(x0), _EPS13)
@@ -283,8 +305,10 @@ def numerical_gradient(compiled: CompiledExpression, x_base: Mapping[str, float]
         env_minus[name] = x0 - h
         yp = _evaluate_scalar(compiled, env_plus)
         ym = _evaluate_scalar(compiled, env_minus)
-        grad[k] = (yp - ym) / (2.0 * h)
-    return grad
+        g = (yp - ym) / (2.0 * h)
+        grad[k] = g
+        errs[k] = _EPS * (abs(yp) + abs(ym)) / (2.0 * h) + _EPS * abs(g)
+    return grad, errs
 
 
 # ---------------------------------------------------------------------------

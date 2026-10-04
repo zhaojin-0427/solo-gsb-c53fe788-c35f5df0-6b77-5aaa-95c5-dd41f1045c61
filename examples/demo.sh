@@ -95,6 +95,64 @@ print("当前登记值是否达标:", d["satisfied"],
       "| 当前 uc(y) =", d["current_combined_standard_uncertainty"]["value"])
 PY
 
-echo "== 6. 反求不写计算记录（计数不因第 5 步增加）=="
+echo "== 6. 小量级反求（真实小正端点/微小非零灵敏度不得被误判，只读）=="
+# y=L（mm），uL=2e-9，目标 1e-9 mm => 闭区间 [0, 1e-9] mm（端点不得被清成 0）
+curl -sS -X POST "$BASE/api/v1/models" -H 'Content-Type: application/json' -d '{
+  "version": "budget-tiny-mm",
+  "name": "恒等模型 y=L（毫米小量级反求示例）",
+  "expression": "L",
+  "inputs": [
+    {"name": "L", "value": 0.0, "unit": "millimeter", "standard_uncertainty": 2e-9, "distribution": "normal"}
+  ],
+  "output_unit": "millimeter",
+  "correlations": []
+}' -o /dev/null -w "model  : HTTP %{http_code}\n" || true
+
+curl -sS -X POST "$BASE/api/v1/precision-budgets" -H 'Content-Type: application/json' -d '{
+  "model_version": "budget-tiny-mm",
+  "input_name": "L",
+  "target": {"standard_uncertainty": 1e-9, "unit": "millimeter"}
+}' -o /tmp/budget_tiny.json -w "budget : HTTP %{http_code}\n"
+
+python3 - <<'PY'
+import json
+d = json.load(open('/tmp/budget_tiny.json'))
+iv = d["interval"]
+assert iv["feasible"] and iv["lower"] == 0.0 and abs(iv["upper"] - 1e-9) <= 1e-18
+print(f"可行 uL 区间: [{iv['lower']}, {iv['upper']}] mm  （理论 [0, 1e-9]，闭区间）")
+print("当前登记值是否达标:", d["satisfied"],
+      "| 灵敏度 =", d["sensitivity"]["coefficient"], d["sensitivity"]["unit"])
+PY
+
+# y = a + 1e-13*b，ub=2e9，目标 1e-4 => ub ∈ [0, 1e9]（1e-13 非零灵敏度不得被判零）
+curl -sS -X POST "$BASE/api/v1/models" -H 'Content-Type: application/json' -d '{
+  "version": "budget-tiny-coef",
+  "name": "y = a + 1e-13*b（小系数大不确定度反求示例）",
+  "expression": "a + 1e-13*b",
+  "inputs": [
+    {"name": "a", "value": 0.0, "unit": "dimensionless", "standard_uncertainty": 0.0, "distribution": "normal"},
+    {"name": "b", "value": 0.0, "unit": "dimensionless", "standard_uncertainty": 2e9, "distribution": "normal"}
+  ],
+  "output_unit": "dimensionless",
+  "correlations": []
+}' -o /dev/null -w "model  : HTTP %{http_code}\n" || true
+
+curl -sS -X POST "$BASE/api/v1/precision-budgets" -H 'Content-Type: application/json' -d '{
+  "model_version": "budget-tiny-coef",
+  "input_name": "b",
+  "target": {"standard_uncertainty": 1e-4, "unit": "dimensionless"}
+}' -o /tmp/budget_tiny_coef.json -w "budget : HTTP %{http_code}\n"
+
+python3 - <<'PY'
+import json
+d = json.load(open('/tmp/budget_tiny_coef.json'))
+iv = d["interval"]
+assert iv["feasible"] and not iv["unbounded_upper"] and abs(iv["upper"] - 1e9) < 1e4
+print(f"可行 ub 区间: [{iv['lower']}, {iv['upper']}]  （理论 [0, 1e9]，有上界）")
+print("当前登记值是否达标:", d["satisfied"],
+      "| 灵敏度 =", d["sensitivity"]["coefficient"], d["sensitivity"]["unit"])
+PY
+
+echo "== 7. 反求不写计算记录（计数不因第 5/6 步增加）=="
 curl -fsS "$BASE/api/v1/evaluations?model_version=budget-sum-rm1" \
   | python3 -c 'import json,sys; print("budget-sum-rm1 的计算记录数:", json.load(sys.stdin)["count"])'

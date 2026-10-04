@@ -19,7 +19,7 @@ from .engine import (
     _EPS,
     _EPS13,
     build_correlation_matrix,
-    numerical_gradient,
+    numerical_gradient_with_errors,
     run_gum,
     run_monte_carlo,
 )
@@ -428,12 +428,25 @@ def _f(x: Any) -> float:
         return float(+Decimal(v))
 
 
+def _endpoint_f(x: float) -> float:
+    """反求端点序列化：统一按 **15 位有效数字** 舍入。
+
+    端点是二次方程的数学根，误差恒为相对量级（中心差分灵敏度的
+    eps^(1/3) 相对误差），用固定 15 位小数会在大端点（如 1e9）上残留
+    1e-7 量级的假尾数（1000000000.0000001），在小端点（如 1e-9）上
+    又会整体舍没。15 位有效数字两端都保留真实值且不带假尾数。
+    """
+    v = float(x)
+    if v == 0.0 or not math.isfinite(v):
+        return round(v, 15)
+    with localcontext() as ctx:
+        ctx.prec = 15
+        return float(+Decimal(v))
+
+
 # ---------------------------------------------------------------------------
 # 测量精度反求（precision budget）
 # ---------------------------------------------------------------------------
-
-#: 名义点灵敏度判定为“零”的相对阈值（线性无关输入如 2*(a-a) 恰为 0）
-_ZERO_SENSITIVITY_REL = 1e-12
 
 
 def _unit_label(spec: str) -> str:
@@ -490,11 +503,17 @@ def solve_precision_budget(req: PrecisionBudgetCreate) -> dict[str, Any]:
         names, [(t[0], t[1], float(t[2])) for t in record["correlations"]], zero_std
     )
 
-    grad = numerical_gradient(compiled, x_base, names)
+    grad, grad_err = numerical_gradient_with_errors(compiled, x_base, names)
     if not np.all(np.isfinite(grad)):
         raise PropagationError("名义点邻域产生了非有限结果（NaN/Inf），无法进行精度反求")
 
     gk = float(grad[k])
+    # 声明单位（物理）尺度下的灵敏度与其中心差分舍入误差界。
+    # 必须在声明单位空间裁决：基本单位空间的固定相对阈值会把“小系数 ×
+    # 大量纲因子/大可行不确定度”的真实非零灵敏度（如 g=1e-13、ub=2e9）
+    # 误判为零，错误给出无上限区间。
+    gk_decl = ctx.sensitivity(req.input_name, gk)
+    gk_err_decl = ctx.output_scale * float(grad_err[k]) * ctx.base_factors[req.input_name]
 
     # 当前登记预算下的合成方差（与 GUM 传播同一二次型）与当前标准不确定度
     cov_cur = std_base[:, None] * corr * std_base[None, :]
@@ -519,8 +538,10 @@ def solve_precision_budget(req: PrecisionBudgetCreate) -> dict[str, Any]:
         C = 0.0
 
     # 4. 端点（先在基本单位空间求解）
-    grad_scale = float(np.max(np.abs(grad))) if len(grad) else 0.0
-    zero_g = gk == 0.0 or abs(gk) <= _ZERO_SENSITIVITY_REL * max(grad_scale, _EPS13)
+    # 零灵敏度按“中心差分舍入误差界”裁决（声明单位空间），而非固定相对
+    # 阈值：结构性零（a−a 等）差分两端位级相等、gk 恰为 0；真实小系数
+    # （1e-13 量级）远大于自身的舍入误差界，必须保留为非零。
+    zero_g = gk == 0.0 or abs(gk_decl) <= gk_err_decl
     # 与 k 相关（登记矩阵中存在边）时，u=0 端点无效：相关系数在零方差处无定义
     correlated = any(names[k] in (t[0], t[1]) for t in record["correlations"])
 
@@ -538,26 +559,37 @@ def solve_precision_budget(req: PrecisionBudgetCreate) -> dict[str, Any]:
             lo_open = correlated  # 相关输入的零端点无效 => 开
     else:
         disc = B * B - 4.0 * A * (C - t_base_sq)
-        # 舍入误差级负判别式（理论相切）钳为 0
-        disc_scale = max(abs(B * B), abs(4.0 * A * (C - t_base_sq)), 1e-300)
+        # 舍入误差级负判别式（理论相切）钳为 0；容差随二次项本身尺度收缩，
+        # 不用与量级无关的固定绝对下限（那会把 1e-18 量级的真实判别式吞没）
+        disc_scale = max(abs(B * B), abs(4.0 * A * (C - t_base_sq)))
         if disc < 0.0 and disc >= -_EPS * max(1.0, len(names)) * disc_scale:
             disc = 0.0
         if disc < 0.0:
             # v(u) 恒大于目标平方（开口向上且无实根）=> 无论 u 取何值都无法达标
             empty = True
         else:
-            # 实根存在：可行域为 [u_-, u_+] 与 u ≥ 0 的交
-            root_eps = _EPS13 * max(math.sqrt(max(disc, 0.0)) / (2.0 * A),
-                                    abs(B) / (2.0 * A), _EPS13)
-            u_minus = (-B - math.sqrt(max(disc, 0.0))) / (2.0 * A)
-            u_plus = (-B + math.sqrt(max(disc, 0.0))) / (2.0 * A)
-            if u_plus < -root_eps:
-                empty = True  # 整个可行区间落在 u < 0（理论上 B≤0 时不应发生，防御式）
+            sqrt_disc = math.sqrt(disc)
+            if sqrt_disc == 0.0:
+                # 理论相切（含目标 0 的单输入）：两根重合于顶点 -B/(2A)
+                u_minus = u_plus = -B / (2.0 * A)
             else:
-                # 与 u ≥ 0 取交
-                if abs(u_minus) <= root_eps:
+                # 稳定求实根（q 法，避免 -B±sqrt 相消）：
+                # q = -(B + sign(B)·√Δ)/2（B=0 时 sign 取 +），根为 q/A 与 (C-t²)/q。
+                # 这保证 1e-12 量级、贴近零的真实小根不被相消误差污染。
+                q = -0.5 * (B + math.copysign(sqrt_disc, B if B != 0.0 else 1.0))
+                u_minus, u_plus = sorted((q / A, (C - t_base_sq) / q))
+
+            # 根的舍入容差随**根自身尺度**收缩：1e-9 mm（基本单位 1e-12）
+            # 这样的真实小正根必须保留，绝不能用固定绝对下限把它钳成 0。
+            root_scale = max(abs(u_minus), abs(u_plus))
+            root_eps = _EPS13 * root_scale
+            if u_plus < -root_eps:
+                empty = True  # 整个可行区间落在 u < 0（防御式）
+            else:
+                # 与 u ≥ 0 取交：仅把根尺度上的舍入零头钳为 0
+                if root_scale > 0.0 and abs(u_minus) <= root_eps:
                     u_minus = 0.0
-                if abs(u_plus) <= root_eps:
+                if root_scale > 0.0 and abs(u_plus) <= root_eps:
                     u_plus = 0.0
                 lo_base = max(u_minus, 0.0)
                 hi_base = max(u_plus, 0.0)
@@ -597,15 +629,18 @@ def solve_precision_budget(req: PrecisionBudgetCreate) -> dict[str, Any]:
             "unbounded_upper": True,
         }
     else:
-        lo_decl = _tidy(lo_base / factor)
-        hi_decl = _tidy(hi_base / factor)
+        # 声明单位空间的清理容差同样随端点自身尺度收缩：真实的小正上界
+        # （如 1e-9 mm）不得被固定绝对阈值清成 0。
+        decl_scale = max(lo_base, hi_base) / factor
+        lo_decl = _tidy(lo_base / factor, decl_scale)
+        hi_decl = _tidy(hi_base / factor, decl_scale)
         if lo_decl > hi_decl:  # 舍入倒置保护
             hi_decl = lo_decl
         interval = {
             "feasible": True,
-            "lower": _f(lo_decl),
+            "lower": _endpoint_f(lo_decl),
             "lower_inclusive": not lo_open,
-            "upper": _f(hi_decl),
+            "upper": _endpoint_f(hi_decl),
             "upper_inclusive": not hi_open,
             "unbounded_upper": False,
         }
@@ -659,10 +694,15 @@ def _target_to_output(unit_spec: str, value: float, out_unit: pint.Unit, out_spe
     return float(q.magnitude)
 
 
-def _tidy(v: float) -> float:
-    """清理 -0.0 与舍入产生的微小负值（端点理论上非负）。"""
+def _tidy(v: float, scale: float = 0.0) -> float:
+    """清理 -0.0 与舍入产生的微小负值（端点理论上非负）。
+
+    容差随端点尺度 ``scale`` 收缩（仅清掉同尺度的舍入零头）；不传尺度时
+    退化为仅处理精确零，避免与量级无关的固定绝对阈值把真实小正端点
+    （如 1e-9 mm）误清为 0。
+    """
     if v == 0.0:
         return 0.0
-    if abs(v) <= _EPS13 * max(1.0, abs(v)):
+    if v < 0.0 and abs(v) <= _EPS13 * max(scale, 0.0):
         return 0.0
     return max(v, 0.0)
